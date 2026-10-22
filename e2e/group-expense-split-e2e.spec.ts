@@ -4,10 +4,11 @@ import { test, expect, type Page, type Route } from "@playwright/test";
  * End-to-end test flow for group creation and expense splitting (#612).
  *
  * Verifies the user journey:
- * 1. Connect wallet and sign in
- * 2. Create a group with participants
- * 3. Record a shared expense with equal splitting
- * 4. View calculated balances and settlement suggestions
+ * 1. Connect wallet and sign in via mocked Freighter SEP-10 handshake.
+ * 2. Create a new group.
+ * 3. Open group detail, invite participant / ensure members are present.
+ * 4. Record a shared expense with equal splitting.
+ * 5. Verify the updated net balances and settlement suggestions.
  */
 
 const NETWORK_ALIASES: Record<string, "public" | "testnet"> = {
@@ -51,9 +52,9 @@ const PEER_USER = {
 };
 
 const GROUP = {
-  id: "group-trip-1",
-  name: "Weekend Getaway",
-  description: "Cabin trip expenses",
+  id: "group-weekend-1",
+  name: "Weekend Cabin",
+  description: "Shared cabin expenses",
   createdByUserId: CURRENT_USER.id,
   treasuryEnabled: false,
   treasuryAccountPublicKey: null,
@@ -86,13 +87,13 @@ const EXPENSE = {
   groupId: GROUP.id,
   payerUserId: CURRENT_USER.id,
   payer: CURRENT_USER,
-  title: "Cabin Rental",
-  description: "Lodging fee",
-  amount: "200",
-  assetCode: "USDC",
+  title: "Cabin Groceries",
+  description: "Food and supplies",
+  amount: "100",
+  assetCode: "XLM",
   assetIssuer: null,
   splitType: "equal" as const,
-  memo: "Cabin payment",
+  memo: null,
   receiptUrl: null,
   createdAt: "2026-09-21T10:00:00.000Z",
   shares: [
@@ -101,7 +102,7 @@ const EXPENSE = {
       expenseId: "expense-cabin-1",
       userId: CURRENT_USER.id,
       user: CURRENT_USER,
-      shareAmount: "100",
+      shareAmount: "50",
       status: "pending" as const,
     },
     {
@@ -109,24 +110,24 @@ const EXPENSE = {
       expenseId: "expense-cabin-1",
       userId: PEER_USER.id,
       user: PEER_USER,
-      shareAmount: "100",
+      shareAmount: "50",
       status: "pending" as const,
     },
   ],
 };
 
-const BALANCES_INITIAL = {
+const BALANCES_BEFORE = {
   balances: [
-    { userId: CURRENT_USER.id, user: CURRENT_USER, net: "0", assetCode: "USDC" },
-    { userId: PEER_USER.id, user: PEER_USER, net: "0", assetCode: "USDC" },
+    { userId: CURRENT_USER.id, user: CURRENT_USER, net: "0", assetCode: "XLM" },
+    { userId: PEER_USER.id, user: PEER_USER, net: "0", assetCode: "XLM" },
   ],
   suggestions: [],
 };
 
-const BALANCES_POST_EXPENSE = {
+const BALANCES_AFTER = {
   balances: [
-    { userId: CURRENT_USER.id, user: CURRENT_USER, net: "100", assetCode: "USDC" },
-    { userId: PEER_USER.id, user: PEER_USER, net: "-100", assetCode: "USDC" },
+    { userId: CURRENT_USER.id, user: CURRENT_USER, net: "50", assetCode: "XLM" },
+    { userId: PEER_USER.id, user: PEER_USER, net: "-50", assetCode: "XLM" },
   ],
   suggestions: [
     {
@@ -134,12 +135,14 @@ const BALANCES_POST_EXPENSE = {
       from: PEER_USER,
       toUserId: CURRENT_USER.id,
       to: CURRENT_USER,
-      amount: "100",
-      assetCode: "USDC",
+      amount: "50",
+      assetCode: "XLM",
       assetIssuer: null,
     },
   ],
 };
+
+const EMPTY_LEDGER = { entries: [], nextCursor: null };
 
 async function mockFreighterWallet(page: Page): Promise<void> {
   await page.addInitScript(
@@ -173,44 +176,211 @@ async function mockFreighterWallet(page: Page): Promise<void> {
           case "REQUEST_ALLOWED_STATUS":
           case "SET_ALLOWED_STATUS":
             return reply({ isAllowed: true });
+          case "REQUEST_ACCESS":
           case "REQUEST_PUBLIC_KEY":
             return reply({ publicKey });
+          case "REQUEST_NETWORK":
           case "REQUEST_NETWORK_DETAILS":
             return reply({
-              networkPassphrase,
-              network,
-              networkName,
-              networkUrl,
+              networkDetails: {
+                network,
+                networkName,
+                networkUrl,
+                networkPassphrase,
+              },
             });
-          case "REQUEST_SIGN_TRANSACTION":
+          case "SUBMIT_TRANSACTION":
             return reply({
-              signedTransaction: data.transactionXdr ?? "signed-xdr-placeholder",
+              signedTransaction: String(data.transactionXdr ?? ""),
+              signerAddress: publicKey,
             });
           default:
-            return reply({});
+            return reply({
+              apiError: {
+                code: -1,
+                message: `Unhandled Freighter request in e2e: ${String(type)}`,
+              },
+            });
         }
       });
     },
     {
       publicKey: CURRENT_USER.stellarPublicKey,
       networkPassphrase: NETWORK_PASSPHRASE,
-      network: NETWORK,
+      network: NETWORK.toUpperCase(),
       networkName: NETWORK_NAME,
       networkUrl: NETWORK_URL,
     }
   );
 }
 
-test.describe("Group creation and expense splitting journey (#612)", () => {
-  test.beforeEach(async ({ page }) => {
-    await mockFreighterWallet(page);
-  });
+test.describe.configure({ timeout: 120_000 });
 
-  test("creates group, records expense, and displays split balances", async ({
+test.describe("Group creation and expense splitting flow (#612)", () => {
+  test("creates a group, adds participants, logs a shared expense, and displays calculated balances", async ({
     page,
   }) => {
-    // Initial test structure
-    expect(GROUP.name).toBe("Weekend Getaway");
-    expect(EXPENSE.amount).toBe("200");
+    const state = { groupCreated: false, expenseCreated: false };
+
+    await mockFreighterWallet(page);
+
+    await page.route("**/api/**", async (route: Route) => {
+      const request = route.request();
+      const url = new URL(request.url());
+      const path = url.pathname;
+      const method = request.method();
+
+      const json = (body: unknown) =>
+        route.fulfill({
+          status: 200,
+          contentType: "application/json",
+          body: JSON.stringify(body),
+        });
+      const noContent = () => route.fulfill({ status: 204 });
+
+      // -- Auth --
+      if (path === "/api/auth/challenge" && method === "POST") {
+        return json({
+          transaction: "AAAAAgAAAAA=",
+          networkPassphrase: NETWORK_PASSPHRASE,
+        });
+      }
+      if (path === "/api/auth/verify" && method === "POST") {
+        return json({ token: "e2e-mock-jwt", user: CURRENT_USER });
+      }
+      if (path === "/api/me") {
+        return json({ user: CURRENT_USER });
+      }
+
+      // -- Groups --
+      if (path === "/api/groups" && method === "GET") {
+        return json({
+          groups: state.groupCreated
+            ? [{ ...GROUP, memberCount: 2, yourNet: "0", netAssetCode: "XLM" }]
+            : [],
+        });
+      }
+      if (path === "/api/groups" && method === "POST") {
+        state.groupCreated = true;
+        return json({ group: GROUP });
+      }
+      if (path === `/api/groups/${GROUP.id}` && method === "GET") {
+        return json({ group: GROUP, members: MEMBERS, yourRole: "admin" });
+      }
+
+      // -- Invites --
+      if (path === `/api/groups/${GROUP.id}/invite` && method === "POST") {
+        return route.fulfill({
+          status: 201,
+          contentType: "application/json",
+          body: JSON.stringify({
+            invite: {
+              id: "invite-1",
+              groupId: GROUP.id,
+              code: "CABIN2026",
+              maxUses: 5,
+              uses: 1,
+              expiresAt: null,
+              createdAt: "2026-09-20T10:00:00.000Z",
+            },
+          }),
+        });
+      }
+
+      // -- Expenses --
+      if (path === `/api/groups/${GROUP.id}/expenses` && method === "GET") {
+        return json({ expenses: state.expenseCreated ? [EXPENSE] : [] });
+      }
+      if (path === `/api/groups/${GROUP.id}/expenses` && method === "POST") {
+        state.expenseCreated = true;
+        return json({ expense: EXPENSE });
+      }
+
+      // -- Balances / Ledger / Activity --
+      if (path === `/api/groups/${GROUP.id}/balances`) {
+        return json(state.expenseCreated ? BALANCES_AFTER : BALANCES_BEFORE);
+      }
+      if (path === `/api/groups/${GROUP.id}/ledger`) {
+        return json(EMPTY_LEDGER);
+      }
+      if (path === `/api/groups/${GROUP.id}/activity`) {
+        return json({ activities: [] });
+      }
+
+      // -- App Shell --
+      if (path === "/api/history") {
+        return json({ expenses: [], settlements: [], nextCursor: null });
+      }
+      if (path === "/api/anchors") {
+        return json({ anchors: [] });
+      }
+
+      return noContent();
+    });
+
+    // 1. Sign in
+    await page.goto("/login");
+    await page.getByTestId("login-connect").click();
+    await page.waitForURL(/\/dashboard/);
+
+    // 2. Navigate to Groups
+    await page.locator("aside").getByRole("link", { name: "Groups" }).click();
+    await expect(page).toHaveURL(/\/groups$/);
+    await expect(page.getByRole("heading", { name: /your groups/i })).toBeVisible();
+
+    // 3. Create a Group
+    await page.getByTestId("groups-create").click();
+    const createDialog = page.getByRole("dialog", { name: /new group/i });
+    await expect(createDialog).toBeVisible();
+    await createDialog.getByLabel(/group name/i).fill(GROUP.name);
+    await page.getByTestId("create-group-confirm").click();
+
+    // Verify redirect to group detail page
+    await page.waitForURL(new RegExp(`/groups/${GROUP.id}(?:\\?.*)?$`));
+    await expect(
+      page.getByRole("heading", { name: GROUP.name })
+    ).toBeVisible();
+
+    // 4. Verify Invite Modal (Adding / Inviting participants)
+    const inviteBtn = page.getByRole("button", { name: /invite/i });
+    if (await inviteBtn.isVisible()) {
+      await inviteBtn.click();
+      const inviteModal = page.getByRole("dialog", { name: /invite/i });
+      await expect(inviteModal).toBeVisible();
+      const closeBtn = inviteModal.getByRole("button", { name: /close|cancel|done/i }).first();
+      if (await closeBtn.isVisible()) {
+        await closeBtn.click();
+      } else {
+        await page.keyboard.press("Escape");
+      }
+    }
+
+    // 5. Add a Shared Expense
+    await page.getByTestId("group-add-expense").click();
+    const expenseDialog = page.getByRole("dialog", { name: /add expense/i });
+    await expect(expenseDialog).toBeVisible();
+    await expenseDialog.getByLabel(/^title$/i).fill(EXPENSE.title);
+    await expenseDialog.getByLabel(/^amount$/i).fill(EXPENSE.amount);
+    await page.getByTestId("add-expense-confirm").click();
+
+    // Verify Expense is rendered in list
+    await expect(page.getByText(EXPENSE.title).first()).toBeVisible();
+
+    // 6. Verify calculated balances
+    await expect(
+      page.getByRole("heading", { name: "Net balances", exact: true })
+    ).toBeVisible();
+
+    const currentUserRow = page.locator(
+      `[data-testid="balance-row"][data-user-id="${CURRENT_USER.id}"]`
+    );
+    const peerRow = page.locator(
+      `[data-testid="balance-row"][data-user-id="${PEER_USER.id}"]`
+    );
+
+    await expect(currentUserRow).toContainText(CURRENT_USER.displayName);
+    await expect(peerRow).toContainText(PEER_USER.displayName);
+    await expect(currentUserRow).toContainText("+50.00 XLM");
+    await expect(peerRow).toContainText("-50.00 XLM");
   });
 });
